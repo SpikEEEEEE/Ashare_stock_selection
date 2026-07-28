@@ -169,8 +169,26 @@ def build_features(market_data: pd.DataFrame, config: AppConfig) -> PreparedData
     frame["eligible"] = eligible.fillna(False)
 
     horizon = config.features.prediction_horizon
-    entry_open = grouped["adj_open"].shift(-1)
-    exit_open = grouped["adj_open"].shift(-(horizon + 1))
+    calendar = pd.DatetimeIndex(sorted(pd.to_datetime(frame["date"].unique())))
+    entry_date_map = {
+        calendar[index]: calendar[index + 1]
+        for index in range(max(0, len(calendar) - 1))
+    }
+    exit_date_map = {
+        calendar[index]: calendar[index + horizon + 1]
+        for index in range(max(0, len(calendar) - horizon - 1))
+    }
+    price_lookup = frame.set_index(["code", "date"])["adj_open"]
+    entry_dates = frame["date"].map(entry_date_map)
+    exit_dates = frame["date"].map(exit_date_map)
+    entry_index = pd.MultiIndex.from_arrays(
+        [frame["code"], entry_dates], names=["code", "date"]
+    )
+    exit_index = pd.MultiIndex.from_arrays(
+        [frame["code"], exit_dates], names=["code", "date"]
+    )
+    entry_open = price_lookup.reindex(entry_index).to_numpy(dtype=float)
+    exit_open = price_lookup.reindex(exit_index).to_numpy(dtype=float)
     frame["forward_return"] = exit_open / entry_open - 1.0
     frame["target_excess_return"] = frame["forward_return"] - frame.groupby(
         "date", sort=False
@@ -184,4 +202,3 @@ def build_features(market_data: pd.DataFrame, config: AppConfig) -> PreparedData
 
     frame = frame.sort_values(["date", "code"], kind="stable").reset_index(drop=True)
     return PreparedData(frame=frame, feature_columns=model_features)
-

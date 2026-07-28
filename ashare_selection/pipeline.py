@@ -379,7 +379,11 @@ def write_selection_result(
     candidate_columns = [
         "date",
         "code",
+        "ts_code",
+        "name",
         "industry",
+        "market",
+        "exchange",
         "candidate_position",
         "global_rank",
         "selection_score",
@@ -403,20 +407,30 @@ def write_selection_result(
     result.candidates[available_candidate_columns].to_csv(
         candidate_path, index=False
     )
-    result.scored_universe[
-        [
-            "date",
-            "code",
-            "industry",
-            "global_rank",
-            "selection_score",
-            "alpha_percentile",
-            "model_score",
-            "close",
-            "avg_amount_liquidity",
-            "eligible",
-        ]
-    ].to_csv(universe_path, index=False)
+    universe_columns = [
+        "date",
+        "code",
+        "ts_code",
+        "name",
+        "industry",
+        "market",
+        "exchange",
+        "global_rank",
+        "selection_score",
+        "alpha_percentile",
+        "model_score",
+        "close",
+        "avg_amount_liquidity",
+        "eligible",
+    ]
+    available_universe_columns = [
+        column
+        for column in universe_columns
+        if column in result.scored_universe.columns
+    ]
+    result.scored_universe[available_universe_columns].to_csv(
+        universe_path, index=False
+    )
     diagnostics_path.write_text(
         json.dumps(asdict(result.diagnostics), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

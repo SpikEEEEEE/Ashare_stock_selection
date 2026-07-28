@@ -36,6 +36,14 @@
   "backtest": {
     "rebalance_every_days": 5,
     "max_periods": 60
+  },
+  "tushare": {
+    "token_env": "TUSHARE_TOKEN",
+    "cache_dir": "data/tushare_cache",
+    "request_interval_seconds": 0.13,
+    "max_retries": 5,
+    "retry_backoff_seconds": 2.0,
+    "refresh_last_trading_days": 2,
+    "include_name_history": true
   }
 }
-

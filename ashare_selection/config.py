@@ -57,6 +57,17 @@ class BacktestConfig:
 
 
 @dataclass
+class TushareConfig:
+    token_env: str = "TUSHARE_TOKEN"
+    cache_dir: str = "data/tushare_cache"
+    request_interval_seconds: float = 0.13
+    max_retries: int = 5
+    retry_backoff_seconds: float = 2.0
+    refresh_last_trading_days: int = 2
+    include_name_history: bool = True
+
+
+@dataclass
 class AppConfig:
     data: DataConfig = field(default_factory=DataConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
@@ -64,6 +75,7 @@ class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
+    tushare: TushareConfig = field(default_factory=TushareConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,6 +120,14 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("buffer_exit_multiplier must be at least 1")
     if config.backtest.rebalance_every_days < 1:
         raise ValueError("rebalance_every_days must be positive")
+    if config.tushare.request_interval_seconds < 0:
+        raise ValueError("request_interval_seconds cannot be negative")
+    if config.tushare.max_retries < 1:
+        raise ValueError("max_retries must be positive")
+    if config.tushare.retry_backoff_seconds < 0:
+        raise ValueError("retry_backoff_seconds cannot be negative")
+    if config.tushare.refresh_last_trading_days < 0:
+        raise ValueError("refresh_last_trading_days cannot be negative")
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -130,4 +150,3 @@ def write_default_config(path: str | Path) -> Path:
         encoding="utf-8",
     )
     return output_path
-

@@ -31,6 +31,107 @@
 python3 -m pip install -r requirements.txt
 ```
 
+## 使用 Tushare 做实际筛选
+
+完整流程需要至少能调用 `trade_cal`、`stock_basic`、`daily`、`daily_basic` 和 `adj_factor`。根据 Tushare 当前权限说明，其中多项接口要求至少 2000 积分：
+
+- [A 股日线 daily](https://tushare.pro/document/2?doc_id=27)
+- [每日指标 daily_basic](https://tushare.pro/document/2?doc_id=32)
+- [复权因子 adj_factor](https://tushare.pro/document/2?doc_id=28)
+- [股票基础信息 stock_basic](https://tushare.pro/document/2?doc_id=25)
+- [交易日历 trade_cal](https://tushare.pro/document/2?doc_id=26)
+
+### 1. 安全设置 Token
+
+Token 只通过环境变量读取，不要写进 Git、Python 文件或 JSON 配置：
+
+```bash
+export TUSHARE_TOKEN='你的真实Token'
+```
+
+可以检查环境变量是否存在，但不要直接打印完整 Token：
+
+```bash
+python3 -c "import os; print('TUSHARE_TOKEN 已设置' if os.getenv('TUSHARE_TOKEN') else '未设置')"
+```
+
+### 2. 下载并直接生成候选池
+
+当前模型使用 500 个交易日训练，并需要额外的特征预热和标签间隔。首次运行建议准备至少约 650 个交易日的数据。例如：
+
+```bash
+python3 -m ashare_selection tushare-select \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --output output/tushare_latest
+```
+
+`--end-date` 默认是执行当天。若当天数据尚未入库，程序会跳过当天并使用最近一个已经取得数据的交易日。
+
+候选结果：
+
+```text
+output/tushare_latest/candidates.csv
+output/tushare_latest/scored_universe.csv
+output/tushare_latest/selection_diagnostics.json
+```
+
+如需同时保存转换后的统一 CSV：
+
+```bash
+python3 -m ashare_selection tushare-select \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --market-output data/tushare_market.csv \
+  --output output/tushare_latest
+```
+
+### 3. 增量更新
+
+API 原始数据按接口和交易日缓存到：
+
+```text
+data/tushare_cache/daily/
+data/tushare_cache/daily_basic/
+data/tushare_cache/adj_factor/
+data/tushare_cache/master/
+```
+
+以后重复执行同一条 `tushare-select` 命令，历史日期直接读取本地缓存，只重新获取配置中指定的最近两个交易日。
+
+有新股上市、退市或行业基础信息需要更新时：
+
+```bash
+python3 -m ashare_selection tushare-select \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --refresh-master \
+  --output output/tushare_latest
+```
+
+### 4. 只下载，不运行筛选
+
+```bash
+python3 -m ashare_selection tushare-download \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --output data/tushare_market.csv
+```
+
+### Tushare 单位与过滤处理
+
+程序会自动进行以下转换：
+
+- `daily.vol`：手 → 股，乘以 100；
+- `daily.amount`：千元 → 元，乘以 1000；
+- `daily_basic.total_mv`：万元 → 元，乘以 10000；
+- `daily_basic.turnover_rate`：百分数 → 小数，除以 100；
+- 使用 `adj_factor` 构造复权价格；
+- 使用 `limit_status` 识别涨停和跌停；
+- 使用 `namechange` 的历史名称区间识别当时的 ST 状态；
+- 停牌股票在 `daily` 中没有记录，因此不会进入当日候选池；
+- 如果未来入场日或退出日停牌，该训练标签会设为缺失，不会把下一次复牌日错误当成指定交易日。
+
 ## 先运行合成数据演示
 
 合成数据仅用于验证程序能否运行，不代表真实收益。
@@ -165,3 +266,5 @@ return = adjusted_open[t + H + 1] / adjusted_open[t + 1] - 1
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+
