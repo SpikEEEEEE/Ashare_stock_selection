@@ -22,7 +22,7 @@
     "target_winsor_quantile": 0.01
   },
   "selection": {
-    "top_k": 200,
+    "top_k": 20,
     "max_industry_fraction": 0.12,
     "volatility_penalty": 0.05,
     "illiquidity_penalty": 0.05,
