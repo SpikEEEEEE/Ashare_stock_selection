@@ -16,12 +16,13 @@
 - 每日横截面百分位排名；
 - 使用下一交易日开盘到未来第 H 个交易日开盘的收益作为标签；
 - 严格按时间截断训练标签，避免未来数据泄漏；
-- 无外部机器学习依赖的岭回归排序基线；
+- LightGBM 非线性回归排序模型；
+- DeepSeek 受限 DSL 特征生成、静态安全检查和本地历史筛选；
 - 波动率和非流动性惩罚；
 - Top-K、行业上限和候选池进出缓冲；
 - 滚动回测、Precision@K、IC、超额收益和换手率输出。
 
-> 本版本的岭回归是用于打通数据和验证流程的基线。正式研究应继续加入 LightGBM Ranker，并与当前基线做严格样本外比较。
+> 当前版本使用 LightGBM 的 `regression_l2` 目标预测未来横截面收益排名。它与论文的梯度提升树预测框架一致，但仍保留本项目的 A 股 Top-K 候选池设计。
 
 ## 安装
 
@@ -30,6 +31,118 @@
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+LightGBM 的主要参数位于配置文件的 `model` 部分：
+
+- `n_estimators`：提升树数量；
+- `learning_rate`：每棵树的学习率；
+- `num_leaves`、`max_depth`：单棵树的复杂度；
+- `min_child_samples`：每个叶节点所需的最少训练样本；
+- `subsample`、`colsample_bytree`：每棵树使用的样本和特征比例；
+- `reg_alpha`、`reg_lambda`：L1 和 L2 正则化强度；
+- `random_state`：随机种子；
+- `n_jobs`：并行线程数，`-1` 表示使用所有可用 CPU。
+
+## 使用 DeepSeek 生成和筛选特征
+
+DeepSeek 只负责提出候选特征。本地程序负责表达式安全检查、时点检查、历史
+IC 评估、覆盖率过滤、相关性去重和最终 LightGBM 训练。当前实现不会执行
+DeepSeek 返回的任意 Python，也不会把价格数据发送给 DeepSeek；API 请求只
+包含字段名称、允许的函数和研究约束。
+
+当前默认模型是 `deepseek-v4-pro`，API 使用 JSON Output。模型名称和接口格式
+以 [DeepSeek 官方 API 文档](https://api-docs.deepseek.com/api/create-chat-completion)
+为准。
+
+### 1. 设置 API Key
+
+```bash
+export DEEPSEEK_API_KEY='你的真实API Key'
+```
+
+配置文件只保存环境变量名称 `DEEPSEEK_API_KEY`，不要把真实 Key 写入 JSON。
+
+### 2. 生成候选特征
+
+```bash
+python3 -m ashare_selection deepseek-generate-features \
+  --config config.tushare.json \
+  --count 30 \
+  --output data/deepseek_features/proposals.json
+```
+
+输出中的每个特征包含名称、受限表达式、经济逻辑和预期方向。允许的表达式
+包括向后看的 `lag`、`rolling_*`、`ema`、`ts_zscore`、安全除法和基础算术。
+负滞后、未来数据、导入、属性访问、下标和任意代码会被拒绝。
+
+### 3. 在固定发现期筛选特征
+
+先准备统一市场 CSV：
+
+```bash
+python3 -m ashare_selection tushare-download \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --output data/tushare_market.csv
+```
+
+然后只用一个预先确定的发现期筛选：
+
+```bash
+python3 -m ashare_selection screen-features \
+  --input data/tushare_market.csv \
+  --definitions data/deepseek_features/proposals.json \
+  --config config.tushare.json \
+  --start-date 20240701 \
+  --end-date 20250630 \
+  --output data/deepseek_features/screened
+```
+
+这里的 `--end-date` 是发现期允许使用的最后一个价格日期。程序会自动把最后
+可参与 IC 计算的特征日期再向前移动 `prediction_horizon + 1` 个交易日，确保
+该特征的未来收益标签也完整落在发现期内。
+
+筛选输出：
+
+- `accepted_features.json`：通过阈值和相关性去重的特征；
+- `screening_report.csv`：每个特征的覆盖率、日度 IC、Newey-West/HAC IC t 值和拒绝原因；
+- `screening_summary.json`：发现期和入选数量。
+
+### 4. 使用通过筛选的特征选股
+
+```bash
+python3 -m ashare_selection tushare-select \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --generated-features data/deepseek_features/screened/accepted_features.json \
+  --output output/tushare_deepseek_latest
+```
+
+也可以把路径写入配置：
+
+```json
+{
+  "features": {
+    "generated_feature_path": "data/deepseek_features/screened/accepted_features.json"
+  }
+}
+```
+
+### 5. 严格样本外回测
+
+发现期结束于 2025-06-30 时，回测从之后开始：
+
+```bash
+python3 -m ashare_selection backtest \
+  --input data/tushare_market.csv \
+  --config config.tushare.json \
+  --generated-features data/deepseek_features/screened/accepted_features.json \
+  --start-date 20250701 \
+  --output output/deepseek_oos_backtest
+```
+
+不能在同一段历史上生成、筛选并报告最终表现，否则会产生特征选择偏差和
+多重检验问题。即使 IC 和回测通过，也应保留独立样本外区间。
 
 ## 使用 Tushare 做实际筛选
 
@@ -251,12 +364,14 @@ return = adjusted_open[t + H + 1] / adjusted_open[t + 1] - 1
 
 随后执行行业数量上限和候选池缓冲。真实项目建议同时比较 `K = 50、100、200、300、500`，选择能保留主要信号且满足后续 AI 成本限制的最小 K。
 
+LightGBM 原生学习非线性关系和特征交互。模型输出仍不是上涨概率，而是用于横截面排序的连续分数；程序会把它转换为当日百分位后再执行风险扣分。
+
 ## 尚未包含
 
 - 手续费、卖出税费、冲击成本和涨跌停排队的完整成交模拟；
 - 财报实际披露时间、分析师预测和公告文本；
-- LightGBM LambdaRank、模型集成和超参数时间滚动验证；
-- 多重检验校正和 LLM 自动生成特征的代码沙箱；
+- LightGBM LambdaRank 目标、模型集成和超参数嵌套时间滚动验证；
+- 更严格的多重检验校正、DSPy/MIPRO 自动提示优化和模型集成；
 - 实盘下单、仓位管理或任何收益保证。
 
 在以上项目完成并通过独立样本外验证前，本项目只应作为研究工具。
@@ -267,4 +382,16 @@ return = adjusted_open[t + H + 1] / adjusted_open[t + 1] - 1
 python3 -m unittest discover -s tests -v
 ```
 
+已有统一市场 CSV 时，可以继续运行 Tushare 回测：
 
+```bash
+python3 -m ashare_selection tushare-download \
+  --start-date 20240101 \
+  --config config.tushare.json \
+  --output data/tushare_market.csv
+
+python3 -m ashare_selection backtest \
+  --input data/tushare_market.csv \
+  --config config.tushare.json \
+  --output output/tushare_backtest
+```

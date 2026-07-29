@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
+
+try:
+    import lightgbm as lgb
+except ImportError as error:  # pragma: no cover - exercised only in a broken environment.
+    raise ImportError(
+        "LightGBM is required. Install project dependencies with "
+        "'python3 -m pip install -r requirements.txt'."
+    ) from error
 
 
 @dataclass(frozen=True)
@@ -12,105 +21,155 @@ class FitDiagnostics:
     active_features: int
     target_mean: float
     target_std: float
+    model_type: str
+    trained_trees: int
 
 
-class RidgeRanker:
-    """Small dependency-free baseline for cross-sectional ranking.
+class LightGBMReturnModel:
+    """LightGBM regression model for cross-sectional future-return ranks."""
 
-    The interface is intentionally narrow so it can later be replaced by a
-    LightGBM LambdaRank model without changing the surrounding pipeline.
-    """
+    MODEL_TYPE = "lightgbm_regression_l2"
 
-    def __init__(self, alpha: float = 20.0, winsor_quantile: float = 0.01):
-        self.alpha = float(alpha)
-        self.winsor_quantile = float(winsor_quantile)
-        self.medians_: np.ndarray | None = None
-        self.means_: np.ndarray | None = None
-        self.scales_: np.ndarray | None = None
+    def __init__(
+        self,
+        *,
+        n_estimators: int = 300,
+        learning_rate: float = 0.03,
+        num_leaves: int = 31,
+        max_depth: int = -1,
+        min_child_samples: int = 500,
+        subsample: float = 0.8,
+        colsample_bytree: float = 0.8,
+        reg_alpha: float = 0.1,
+        reg_lambda: float = 1.0,
+        random_state: int = 42,
+        n_jobs: int = -1,
+        target_winsor_quantile: float = 0.01,
+    ):
+        self.target_winsor_quantile = float(target_winsor_quantile)
+        self.params = {
+            "objective": "regression_l2",
+            "boosting_type": "gbdt",
+            "metric": "l2",
+            "learning_rate": float(learning_rate),
+            "num_leaves": int(num_leaves),
+            "max_depth": int(max_depth),
+            "min_data_in_leaf": int(min_child_samples),
+            "bagging_fraction": float(subsample),
+            "bagging_freq": 1 if float(subsample) < 1.0 else 0,
+            "feature_fraction": float(colsample_bytree),
+            "lambda_l1": float(reg_alpha),
+            "lambda_l2": float(reg_lambda),
+            "seed": int(random_state),
+            "bagging_seed": int(random_state),
+            "feature_fraction_seed": int(random_state),
+            "data_random_seed": int(random_state),
+            "num_threads": 0 if int(n_jobs) == -1 else int(n_jobs),
+            "deterministic": True,
+            "force_col_wise": True,
+            "verbosity": -1,
+        }
+        self.n_estimators = int(n_estimators)
         self.active_: np.ndarray | None = None
-        self.coef_: np.ndarray | None = None
-        self.intercept_: float | None = None
+        self.feature_names_: list[str] | None = None
+        self.model_: lgb.Booster | None = None
         self.diagnostics_: FitDiagnostics | None = None
 
-    def fit(self, features: np.ndarray, target: np.ndarray) -> "RidgeRanker":
-        x = np.asarray(features, dtype=float)
-        y = np.asarray(target, dtype=float)
+    @staticmethod
+    def _active_feature_mask(features: np.ndarray) -> np.ndarray:
+        active = np.zeros(features.shape[1], dtype=bool)
+        for column_index in range(features.shape[1]):
+            values = features[:, column_index]
+            finite_values = values[np.isfinite(values)]
+            active[column_index] = (
+                len(finite_values) >= 2
+                and float(np.ptp(finite_values)) > 1e-10
+            )
+        return active
+
+    def fit(
+        self,
+        features: np.ndarray,
+        target: np.ndarray,
+        feature_names: Sequence[str] | None = None,
+    ) -> "LightGBMReturnModel":
+        x = np.asarray(features, dtype=np.float32)
+        y = np.asarray(target, dtype=np.float32)
         if x.ndim != 2:
             raise ValueError("features must be a two-dimensional array")
         if len(x) != len(y):
             raise ValueError("features and target have inconsistent row counts")
+        if feature_names is not None and len(feature_names) != x.shape[1]:
+            raise ValueError("feature_names count does not match feature columns")
 
         valid_target = np.isfinite(y)
-        x = x[valid_target]
-        y = y[valid_target]
+        if not valid_target.all():
+            x = x[valid_target]
+            y = y[valid_target]
         if len(y) < 2:
             raise ValueError("Not enough finite target observations")
 
-        medians = np.zeros(x.shape[1], dtype=float)
-        for column_index in range(x.shape[1]):
-            finite = np.isfinite(x[:, column_index])
-            if finite.any():
-                medians[column_index] = float(np.median(x[finite, column_index]))
-        x = np.where(np.isfinite(x), x, medians)
-
-        means = x.mean(axis=0)
-        scales = x.std(axis=0)
-        active = np.isfinite(scales) & (scales > 1e-10)
+        invalid_features = ~np.isfinite(x)
+        if invalid_features.any():
+            x[invalid_features] = np.nan
+        active = self._active_feature_mask(x)
         if not active.any():
-            raise ValueError("All model features are constant")
+            raise ValueError("All model features are constant or missing")
 
-        x_active = (x[:, active] - means[active]) / scales[active]
-        if 0 < self.winsor_quantile < 0.5:
+        if 0 < self.target_winsor_quantile < 0.5:
             lower, upper = np.quantile(
-                y, [self.winsor_quantile, 1.0 - self.winsor_quantile]
+                y,
+                [
+                    self.target_winsor_quantile,
+                    1.0 - self.target_winsor_quantile,
+                ],
             )
             y = np.clip(y, lower, upper)
 
-        target_mean = float(y.mean())
-        centered_target = y - target_mean
-        gram = x_active.T @ x_active
-        penalty = np.eye(gram.shape[0], dtype=float) * self.alpha
-        coef_active = np.linalg.solve(
-            gram + penalty, x_active.T @ centered_target
+        if feature_names is None:
+            all_feature_names = [f"feature_{index}" for index in range(x.shape[1])]
+        else:
+            all_feature_names = [str(name) for name in feature_names]
+        active_feature_names = [
+            name for name, is_active in zip(all_feature_names, active) if is_active
+        ]
+
+        train_set = lgb.Dataset(
+            x[:, active],
+            label=y,
+            feature_name=active_feature_names,
+            free_raw_data=True,
+        )
+        model = lgb.train(
+            params=self.params,
+            train_set=train_set,
+            num_boost_round=self.n_estimators,
         )
 
-        coef = np.zeros(x.shape[1], dtype=float)
-        coef[active] = coef_active
-        self.medians_ = medians
-        self.means_ = means
-        self.scales_ = np.where(scales > 1e-10, scales, 1.0)
         self.active_ = active
-        self.coef_ = coef
-        self.intercept_ = target_mean
+        self.feature_names_ = all_feature_names
+        self.model_ = model
         self.diagnostics_ = FitDiagnostics(
             rows=len(y),
             total_features=x.shape[1],
             active_features=int(active.sum()),
-            target_mean=target_mean,
+            target_mean=float(y.mean()),
             target_std=float(y.std()),
+            model_type=self.MODEL_TYPE,
+            trained_trees=int(model.current_iteration()),
         )
         return self
 
     def predict(self, features: np.ndarray) -> np.ndarray:
-        if any(
-            item is None
-            for item in (
-                self.medians_,
-                self.means_,
-                self.scales_,
-                self.active_,
-                self.coef_,
-                self.intercept_,
-            )
-        ):
+        if self.active_ is None or self.model_ is None:
             raise RuntimeError("Model must be fitted before prediction")
 
-        x = np.asarray(features, dtype=float)
+        x = np.asarray(features, dtype=np.float32)
         if x.ndim != 2:
             raise ValueError("features must be a two-dimensional array")
-        if x.shape[1] != len(self.coef_):
+        if x.shape[1] != len(self.active_):
             raise ValueError("Prediction feature count does not match fitted model")
-        x = np.where(np.isfinite(x), x, self.medians_)
-        standardized = (x - self.means_) / self.scales_
-        return self.intercept_ + standardized @ self.coef_
-
+        invalid_features = ~np.isfinite(x)
+        if invalid_features.any():
+            x[invalid_features] = np.nan
+        return np.asarray(self.model_.predict(x[:, self.active_]), dtype=float)

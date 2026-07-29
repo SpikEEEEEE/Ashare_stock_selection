@@ -12,11 +12,12 @@ import pandas as pd
 from .config import AppConfig
 from .data import load_market_data
 from .features import PreparedData, build_features
-from .model import RidgeRanker
+from .model import LightGBMReturnModel
 
 
 @dataclass(frozen=True)
 class SelectionDiagnostics:
+    model_type: str
     score_date: str
     training_start: str
     training_end: str
@@ -25,6 +26,7 @@ class SelectionDiagnostics:
     eligible_stocks: int
     selected_stocks: int
     active_features: int
+    trained_trees: int
     industry_cap: int
 
 
@@ -77,7 +79,13 @@ class CandidateSelector:
         self,
         prepared: PreparedData,
         as_of: str | pd.Timestamp | None,
-    ) -> tuple[pd.DataFrame, RidgeRanker, pd.Timestamp, pd.Timestamp, int]:
+    ) -> tuple[
+        pd.DataFrame,
+        LightGBMReturnModel,
+        pd.Timestamp,
+        pd.Timestamp,
+        int,
+    ]:
         score_date, dates, score_index = self._resolve_score_date(prepared, as_of)
         horizon = self.config.features.prediction_horizon
         training_end_index = score_index - horizon - 1
@@ -111,16 +119,28 @@ class CandidateSelector:
         if scored.empty:
             raise ValueError(f"No eligible stocks on {score_date.date()}")
 
-        model = RidgeRanker(
-            alpha=self.config.model.ridge_alpha,
-            winsor_quantile=self.config.model.target_winsor_quantile,
+        model_config = self.config.model
+        model = LightGBMReturnModel(
+            n_estimators=model_config.n_estimators,
+            learning_rate=model_config.learning_rate,
+            num_leaves=model_config.num_leaves,
+            max_depth=model_config.max_depth,
+            min_child_samples=model_config.min_child_samples,
+            subsample=model_config.subsample,
+            colsample_bytree=model_config.colsample_bytree,
+            reg_alpha=model_config.reg_alpha,
+            reg_lambda=model_config.reg_lambda,
+            random_state=model_config.random_state,
+            n_jobs=model_config.n_jobs,
+            target_winsor_quantile=model_config.target_winsor_quantile,
         )
         model.fit(
-            train[prepared.feature_columns].to_numpy(dtype=float),
-            train["target_rank"].to_numpy(dtype=float),
+            train[prepared.feature_columns].to_numpy(dtype=np.float32),
+            train["target_rank"].to_numpy(dtype=np.float32),
+            feature_names=prepared.feature_columns,
         )
         scored["model_score"] = model.predict(
-            scored[prepared.feature_columns].to_numpy(dtype=float)
+            scored[prepared.feature_columns].to_numpy(dtype=np.float32)
         )
         scored["alpha_percentile"] = scored["model_score"].rank(
             method="average", pct=True
@@ -229,6 +249,7 @@ class CandidateSelector:
             scored, previous_codes
         )
         diagnostics = SelectionDiagnostics(
+            model_type=model.diagnostics_.model_type,
             score_date=pd.Timestamp(scored["date"].iloc[0]).date().isoformat(),
             training_start=training_start.date().isoformat(),
             training_end=training_end.date().isoformat(),
@@ -237,6 +258,7 @@ class CandidateSelector:
             eligible_stocks=len(scored),
             selected_stocks=len(candidates),
             active_features=int(model.diagnostics_.active_features),
+            trained_trees=int(model.diagnostics_.trained_trees),
             industry_cap=industry_cap,
         )
         return SelectionResult(
@@ -262,7 +284,12 @@ class CandidateSelector:
         prepared = self.prepare_from_csv(input_path)
         return self.select_prepared(prepared, as_of, previous_codes)
 
-    def backtest_prepared(self, prepared: PreparedData) -> BacktestResult:
+    def backtest_prepared(
+        self,
+        prepared: PreparedData,
+        start_date: str | pd.Timestamp | None = None,
+        end_date: str | pd.Timestamp | None = None,
+    ) -> BacktestResult:
         frame = prepared.frame
         dates = pd.DatetimeIndex(sorted(pd.to_datetime(frame["date"].unique())))
         horizon = self.config.features.prediction_horizon
@@ -273,6 +300,12 @@ class CandidateSelector:
 
         step = self.config.backtest.rebalance_every_days
         score_dates = list(dates[start_index:stop_index:step])
+        if start_date is not None:
+            requested_start = pd.Timestamp(start_date)
+            score_dates = [date for date in score_dates if date >= requested_start]
+        if end_date is not None:
+            requested_end = pd.Timestamp(end_date)
+            score_dates = [date for date in score_dates if date <= requested_end]
         max_periods = self.config.backtest.max_periods
         if max_periods is not None:
             score_dates = score_dates[-max_periods:]

@@ -30,15 +30,26 @@ class FeatureConfig:
     momentum_windows: list[int] = field(default_factory=lambda: [5, 10, 20, 60])
     volatility_windows: list[int] = field(default_factory=lambda: [20, 60])
     min_feature_history: int = 60
+    generated_feature_path: str | None = None
 
 
 @dataclass
 class ModelConfig:
-    ridge_alpha: float = 20.0
     train_lookback_days: int = 500
     min_train_days: int = 240
     min_train_rows: int = 5_000
     target_winsor_quantile: float = 0.01
+    n_estimators: int = 300
+    learning_rate: float = 0.03
+    num_leaves: int = 31
+    max_depth: int = -1
+    min_child_samples: int = 500
+    subsample: float = 0.8
+    colsample_bytree: float = 0.8
+    reg_alpha: float = 0.1
+    reg_lambda: float = 1.0
+    random_state: int = 42
+    n_jobs: int = -1
 
 
 @dataclass
@@ -68,6 +79,32 @@ class TushareConfig:
 
 
 @dataclass
+class DeepSeekConfig:
+    api_key_env: str = "DEEPSEEK_API_KEY"
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-v4-pro"
+    thinking_enabled: bool = True
+    temperature: float = 0.2
+    max_tokens: int = 8_000
+    timeout_seconds: float = 120.0
+    max_retries: int = 3
+    retry_backoff_seconds: float = 2.0
+    proposal_count: int = 30
+
+
+@dataclass
+class FeatureScreeningConfig:
+    min_feature_coverage: float = 0.80
+    min_screening_days: int = 120
+    min_cross_sectional_stocks: int = 100
+    min_abs_mean_ic: float = 0.002
+    min_abs_ic_tstat: float = 1.0
+    max_pairwise_correlation: float = 0.85
+    correlation_sample_rows: int = 200_000
+    max_selected_features: int = 30
+
+
+@dataclass
 class AppConfig:
     data: DataConfig = field(default_factory=DataConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
@@ -76,6 +113,10 @@ class AppConfig:
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     tushare: TushareConfig = field(default_factory=TushareConfig)
+    deepseek: DeepSeekConfig = field(default_factory=DeepSeekConfig)
+    feature_screening: FeatureScreeningConfig = field(
+        default_factory=FeatureScreeningConfig
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -112,6 +153,28 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("train_lookback_days cannot be smaller than min_train_days")
     if config.model.min_train_rows < 100:
         raise ValueError("min_train_rows must be at least 100")
+    if not 0 <= config.model.target_winsor_quantile < 0.5:
+        raise ValueError("target_winsor_quantile must be in [0, 0.5)")
+    if config.model.n_estimators < 1:
+        raise ValueError("n_estimators must be positive")
+    if config.model.learning_rate <= 0:
+        raise ValueError("learning_rate must be positive")
+    if config.model.num_leaves < 2:
+        raise ValueError("num_leaves must be at least 2")
+    if config.model.max_depth == 0 or config.model.max_depth < -1:
+        raise ValueError("max_depth must be -1 or a positive integer")
+    if config.model.min_child_samples < 1:
+        raise ValueError("min_child_samples must be positive")
+    if not 0 < config.model.subsample <= 1:
+        raise ValueError("subsample must be in (0, 1]")
+    if not 0 < config.model.colsample_bytree <= 1:
+        raise ValueError("colsample_bytree must be in (0, 1]")
+    if config.model.reg_alpha < 0:
+        raise ValueError("reg_alpha cannot be negative")
+    if config.model.reg_lambda < 0:
+        raise ValueError("reg_lambda cannot be negative")
+    if config.model.n_jobs != -1 and config.model.n_jobs < 1:
+        raise ValueError("n_jobs must be -1 or a positive integer")
     if config.selection.top_k < 1:
         raise ValueError("top_k must be positive")
     if not 0 < config.selection.max_industry_fraction <= 1:
@@ -128,6 +191,43 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("retry_backoff_seconds cannot be negative")
     if config.tushare.refresh_last_trading_days < 0:
         raise ValueError("refresh_last_trading_days cannot be negative")
+    if not config.deepseek.api_key_env.strip():
+        raise ValueError("deepseek.api_key_env cannot be empty")
+    if not config.deepseek.base_url.startswith("https://"):
+        raise ValueError("deepseek.base_url must be an HTTPS URL")
+    if not config.deepseek.model.strip():
+        raise ValueError("deepseek.model cannot be empty")
+    if not 0 <= config.deepseek.temperature <= 2:
+        raise ValueError("deepseek.temperature must be in [0, 2]")
+    if config.deepseek.max_tokens < 256:
+        raise ValueError("deepseek.max_tokens must be at least 256")
+    if config.deepseek.timeout_seconds <= 0:
+        raise ValueError("deepseek.timeout_seconds must be positive")
+    if config.deepseek.max_retries < 1:
+        raise ValueError("deepseek.max_retries must be positive")
+    if config.deepseek.retry_backoff_seconds < 0:
+        raise ValueError("deepseek.retry_backoff_seconds cannot be negative")
+    if config.deepseek.proposal_count < 1:
+        raise ValueError("deepseek.proposal_count must be positive")
+    if config.deepseek.proposal_count > 100:
+        raise ValueError("deepseek.proposal_count cannot exceed 100")
+    screening = config.feature_screening
+    if not 0 < screening.min_feature_coverage <= 1:
+        raise ValueError("min_feature_coverage must be in (0, 1]")
+    if screening.min_screening_days < 2:
+        raise ValueError("min_screening_days must be at least 2")
+    if screening.min_cross_sectional_stocks < 2:
+        raise ValueError("min_cross_sectional_stocks must be at least 2")
+    if screening.min_abs_mean_ic < 0:
+        raise ValueError("min_abs_mean_ic cannot be negative")
+    if screening.min_abs_ic_tstat < 0:
+        raise ValueError("min_abs_ic_tstat cannot be negative")
+    if not 0 < screening.max_pairwise_correlation <= 1:
+        raise ValueError("max_pairwise_correlation must be in (0, 1]")
+    if screening.correlation_sample_rows < 100:
+        raise ValueError("correlation_sample_rows must be at least 100")
+    if screening.max_selected_features < 1:
+        raise ValueError("max_selected_features must be positive")
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:

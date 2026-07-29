@@ -9,7 +9,17 @@ from pathlib import Path
 import pandas as pd
 
 from .config import load_config, write_default_config
+from .data import load_market_data
+from .deepseek_features import (
+    DeepSeekFeatureGenerator,
+    write_deepseek_generation_result,
+)
 from .demo import generate_demo_data
+from .generated_features import (
+    load_feature_definitions,
+    screen_feature_definitions,
+    write_feature_screening_result,
+)
 from .pipeline import (
     CandidateSelector,
     write_backtest_result,
@@ -46,6 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
     select_parser.add_argument("--output", default="output/latest")
     select_parser.add_argument("--as-of")
     select_parser.add_argument("--previous")
+    select_parser.add_argument("--generated-features")
 
     backtest_parser = subparsers.add_parser(
         "backtest", help="运行严格时间滚动的候选池回测"
@@ -53,6 +64,9 @@ def _build_parser() -> argparse.ArgumentParser:
     backtest_parser.add_argument("--input", required=True)
     backtest_parser.add_argument("--config", default="config.json")
     backtest_parser.add_argument("--output", default="output/backtest")
+    backtest_parser.add_argument("--generated-features")
+    backtest_parser.add_argument("--start-date")
+    backtest_parser.add_argument("--end-date")
 
     tushare_download_parser = subparsers.add_parser(
         "tushare-download", help="从 Tushare 增量下载并转换 A 股日线数据"
@@ -82,8 +96,34 @@ def _build_parser() -> argparse.ArgumentParser:
     tushare_select_parser.add_argument("--cache-dir")
     tushare_select_parser.add_argument("--as-of")
     tushare_select_parser.add_argument("--previous")
+    tushare_select_parser.add_argument("--generated-features")
     tushare_select_parser.add_argument("--force-refresh", action="store_true")
     tushare_select_parser.add_argument("--refresh-master", action="store_true")
+
+    deepseek_parser = subparsers.add_parser(
+        "deepseek-generate-features",
+        help="调用 DeepSeek 生成受限 DSL 特征候选",
+    )
+    deepseek_parser.add_argument("--config", default="config.json")
+    deepseek_parser.add_argument(
+        "--output",
+        default="data/deepseek_features/proposals.json",
+    )
+    deepseek_parser.add_argument("--count", type=int)
+
+    screen_parser = subparsers.add_parser(
+        "screen-features",
+        help="按覆盖率、日度 IC 和相关性筛选生成特征",
+    )
+    screen_parser.add_argument("--input", required=True)
+    screen_parser.add_argument("--definitions", required=True)
+    screen_parser.add_argument("--config", default="config.json")
+    screen_parser.add_argument(
+        "--output",
+        default="data/deepseek_features/screened",
+    )
+    screen_parser.add_argument("--start-date")
+    screen_parser.add_argument("--end-date")
     return parser
 
 
@@ -105,6 +145,55 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     if getattr(args, "cache_dir", None):
         config.tushare.cache_dir = args.cache_dir
+    if getattr(args, "generated_features", None):
+        config.features.generated_feature_path = args.generated_features
+
+    if args.command == "deepseek-generate-features":
+        generator = DeepSeekFeatureGenerator(config)
+        result = generator.generate(args.count)
+        output = write_deepseek_generation_result(result, args.output)
+        print(
+            json.dumps(
+                {
+                    "model": result.model,
+                    "valid_features": len(result.features),
+                    "rejected_features": len(result.rejected),
+                    "usage": result.usage,
+                    "output": str(output),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "screen-features":
+        definitions = load_feature_definitions(args.definitions)
+        market = load_market_data(args.input, config)
+        result = screen_feature_definitions(
+            market,
+            config,
+            definitions,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        paths = write_feature_screening_result(result, args.output)
+        print(
+            json.dumps(
+                {
+                    "screening_start": result.screening_start,
+                    "screening_end": result.screening_end,
+                    "label_data_end": result.label_data_end,
+                    "screening_rows": result.screening_rows,
+                    "candidate_features": result.candidate_features,
+                    "accepted_features": len(result.accepted),
+                    "files": {name: str(path) for name, path in paths.items()},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
 
     if args.command in {"tushare-download", "tushare-select"}:
         source = TushareDataSource(
@@ -182,7 +271,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "backtest":
         prepared = selector.prepare_from_csv(args.input)
-        result = selector.backtest_prepared(prepared)
+        result = selector.backtest_prepared(
+            prepared,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
         paths = write_backtest_result(result, args.output)
         payload = {
             "summary": result.summary,

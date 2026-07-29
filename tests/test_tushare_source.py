@@ -142,6 +142,13 @@ def tushare_test_config(cache_dir: Path) -> AppConfig:
     config.model.train_lookback_days = 100
     config.model.min_train_days = 60
     config.model.min_train_rows = 1_000
+    config.model.n_estimators = 20
+    config.model.learning_rate = 0.1
+    config.model.num_leaves = 7
+    config.model.min_child_samples = 10
+    config.model.subsample = 1.0
+    config.model.colsample_bytree = 1.0
+    config.model.n_jobs = 1
     config.selection.top_k = 5
     config.selection.max_industry_fraction = 0.4
     return config
@@ -187,4 +194,3 @@ class TushareSourceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

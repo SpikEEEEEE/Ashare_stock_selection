@@ -6,6 +6,12 @@ import numpy as np
 import pandas as pd
 
 from .config import AppConfig
+from .generated_features import (
+    DEFAULT_GENERATED_FEATURE_INPUTS,
+    FeatureDefinition,
+    apply_generated_features,
+    load_feature_definitions,
+)
 
 
 @dataclass(frozen=True)
@@ -49,12 +55,16 @@ def _cross_sectional_rank(frame: pd.DataFrame, columns: list[str]) -> list[str]:
                 method="average", pct=True, na_option="keep"
             )
             - 0.5
-        )
+        ).astype(np.float32)
         ranked_columns.append(ranked_name)
     return ranked_columns
 
 
-def build_features(market_data: pd.DataFrame, config: AppConfig) -> PreparedData:
+def build_features(
+    market_data: pd.DataFrame,
+    config: AppConfig,
+    generated_definitions: list[FeatureDefinition] | None = None,
+) -> PreparedData:
     frame = market_data.copy()
     grouped = frame.groupby("code", sort=False, group_keys=False)
     eps = 1e-12
@@ -144,9 +154,31 @@ def build_features(market_data: pd.DataFrame, config: AppConfig) -> PreparedData
         ]
     )
     raw_features = list(dict.fromkeys(raw_features))
-    model_features = _cross_sectional_rank(frame, raw_features)
+    baseline_model_features = _cross_sectional_rank(frame, raw_features)
 
-    feature_coverage = frame[model_features].notna().mean(axis=1)
+    generated_inputs = (
+        set(DEFAULT_GENERATED_FEATURE_INPUTS) | set(raw_features)
+    ) & set(frame.columns)
+    if generated_definitions is None and config.features.generated_feature_path:
+        generated_definitions = load_feature_definitions(
+            config.features.generated_feature_path,
+            allowed_names=generated_inputs,
+        )
+    generated_model_features: list[str] = []
+    if generated_definitions:
+        generated_columns = apply_generated_features(
+            frame,
+            generated_definitions,
+            allowed_names=generated_inputs,
+        )
+        generated_model_features = _cross_sectional_rank(
+            frame,
+            generated_columns,
+        )
+        frame.drop(columns=generated_columns, inplace=True)
+    model_features = [*baseline_model_features, *generated_model_features]
+
+    feature_coverage = frame[baseline_model_features].notna().mean(axis=1)
     frame["feature_ready"] = (
         frame["listing_days"].ge(config.features.min_feature_history)
         & feature_coverage.ge(0.60)

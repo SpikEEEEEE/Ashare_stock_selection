@@ -22,6 +22,13 @@ def small_test_config() -> AppConfig:
     config.model.train_lookback_days = 160
     config.model.min_train_days = 100
     config.model.min_train_rows = 1_000
+    config.model.n_estimators = 30
+    config.model.learning_rate = 0.1
+    config.model.num_leaves = 7
+    config.model.min_child_samples = 10
+    config.model.subsample = 1.0
+    config.model.colsample_bytree = 1.0
+    config.model.n_jobs = 1
     config.selection.top_k = 10
     config.selection.max_industry_fraction = 0.30
     config.backtest.rebalance_every_days = 5
@@ -75,6 +82,14 @@ class CandidatePipelineTest(unittest.TestCase):
         self.assertFalse(candidates["is_st"].any())
         self.assertFalse(candidates["is_suspended"].any())
         self.assertFalse(candidates["is_limit_up"].any())
+        self.assertEqual(
+            result.diagnostics.model_type,
+            "lightgbm_regression_l2",
+        )
+        self.assertEqual(
+            result.diagnostics.trained_trees,
+            self.config.model.n_estimators,
+        )
         cap = int(
             np.ceil(
                 self.config.selection.top_k
@@ -95,4 +110,3 @@ class CandidatePipelineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
